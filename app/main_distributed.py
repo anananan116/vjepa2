@@ -47,13 +47,13 @@ parser.add_argument(
 parser.add_argument(
     "--account",
     type=str,
-    default="jepa",
+    default="yi.gu",
     help="Cluster account to use when submitting jobs",
 )
 parser.add_argument(
     "--partition",
     type=str,
-    default="learn",
+    default="main",
     help="Cluster partition to use when submitting jobs",
 )
 parser.add_argument(
@@ -91,23 +91,7 @@ class Trainer:
         )
 
 
-def copy_code_folder(code_folder, ignore_patterns, ignore_paths):
-    path_to_node_folder = {}
 
-    for path in ignore_paths:
-        split_path = path.split("/")
-        base_path = "/".join(split_path[:-1])
-        node_folder = split_path[-1]
-        path_to_node_folder[base_path] = node_folder
-
-    def ignore_func(path, names):
-        ignore_list = ignore_patterns
-        if path in path_to_node_folder.keys():
-            ignore_list.append(path_to_node_folder[path])
-        return ignore_list
-
-    if not os.path.exists(code_folder):
-        shutil.copytree(".", code_folder, ignore=ignore_func)
 
 
 def update_folder_with_timestamp(args_list):
@@ -141,22 +125,7 @@ def launch_app_with_parsed_args(
         Path(folder).mkdir(parents=True, exist_ok=True)
     folder = args_for_pretrain[0]["folder"]
 
-    # -------------- Copy code --------------
-    code_folder = os.path.join(folder, "code")
-    ignore_patterns = [
-        "__pycache__",
-        ".vscode",
-        ".git",
-        "core",
-    ]
-    ignore_paths = [
-        "./evals/ava/alphaction/data",
-        "./demos",
-        "./traces",
-    ]
-    copy_code_folder(code_folder, ignore_patterns, ignore_paths)
-    os.chdir(code_folder)
-    # ---------------------------------------
+
 
     # -------------- Save config file --------------
     params_path = os.path.join(folder, "params-pretrain.yaml")
@@ -182,7 +151,7 @@ def launch_app_with_parsed_args(
     executor.update_parameters(
         name=job_name,
         slurm_partition=partition,
-        slurm_account=account,
+        # slurm_account=account,
         slurm_qos=qos,
         slurm_mem_per_gpu=mem_per_gpu,
         timeout_min=timeout,

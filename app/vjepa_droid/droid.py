@@ -17,6 +17,7 @@ import torch
 import torch.utils.data
 from decord import VideoReader, cpu
 from scipy.spatial.transform import Rotation
+import json
 
 _GLOBAL_SEED = 0
 logger = getLogger()
@@ -114,23 +115,26 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         self.camera_views = camera_views
         self.h5_name = "trajectory.h5"
 
-        samples = list(pd.read_csv(data_path, header=None, delimiter=" ").values[:, 0])
+        samples = []
+        with open(data_path, "r") as f:
+            for line in f:
+                samples.append(json.loads(line))
         self.samples = samples
 
     def __getitem__(self, index):
-        path = self.samples[index]
+        loaded_sample = self.samples[index]
 
         # -- keep trying to load videos until you find a valid sample
         loaded_video = False
         while not loaded_video:
             try:
-                buffer, actions, states, extrinsics, indices = self.loadvideo_decord(path)
+                buffer, actions, states, extrinsics, indices = self.loadvideo_decord(loaded_sample)
                 loaded_video = True
             except Exception as e:
-                logger.info(f"Encountered exception when loading video {path=} {e=}")
+                logger.info(f"Encountered exception when loading video {loaded_sample=} {e=}")
                 loaded_video = False
                 index = np.random.randint(self.__len__())
-                path = self.samples[index]
+                loaded_sample = self.samples[index]
 
         return buffer, actions, states, extrinsics, indices
 
@@ -146,58 +150,11 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         closedness_delta = closedness[1:] - closedness[:-1]
         return np.concatenate([xyz_diff, angle_diff, closedness_delta], axis=1)
 
-    def transform_frame(self, poses, extrinsics):
-        gripper = poses[:, -1:]
-        poses = poses[:, :-1]
-
-        def pose_to_transform(pose):
-            trans = pose[:3]  # shape [3]
-            theta = pose[3:6]  # euler angles, shape [3]
-            Rot = Rotation.from_euler("xyz", theta, degrees=False).as_matrix()
-            T = np.eye(4)
-            T[:3, :3] = Rot
-            T[:3, 3] = trans
-            return T
-
-        def transform_to_pose(transform):
-            trans = transform[:3, 3]
-            Rot = transform[:3, :3]
-            angle = Rotation.from_matrix(Rot).as_euler("xyz", degrees=False)
-            return np.concatenate([trans, angle], axis=0)
-
-        new_pose = []
-        for p, e in zip(poses, extrinsics):
-            p_transform = pose_to_transform(p)
-            e_transform = pose_to_transform(e)
-            new_pose_transform = np.linalg.inv(e_transform) @ p_transform
-            new_pose += [transform_to_pose(new_pose_transform)]
-        new_pose = np.stack(new_pose, axis=0)
-
-        return np.concatenate([new_pose, gripper], axis=1)
-
-    def loadvideo_decord(self, path):
+    def loadvideo_decord(self, loaded_sample):
         # -- load metadata
-        metadata = get_json(path)
-        if metadata is None:
-            raise Exception(f"No metadata for video {path=}")
-
-        # -- load trajectory info
-        tpath = os.path.join(path, self.h5_name)
-        trajectory = h5py.File(tpath)
-
-        # -- randomly sample a camera view
-        camera_view = self.camera_views[torch.randint(0, len(self.camera_views), (1,))]
-        mp4_name = metadata[camera_view].split("recordings/MP4/")[-1]
-        camera_name = mp4_name.split(".")[0]
-        extrinsics = trajectory["observation"]["camera_extrinsics"][f"{camera_name}_left"]
-        states = np.concatenate(
-            [
-                np.array(trajectory["observation"]["robot_state"]["cartesian_position"]),
-                np.array(trajectory["observation"]["robot_state"]["gripper_position"])[:, None],
-            ],
-            axis=1,
-        )  # [T, 7]
-        vpath = os.path.join(path, "recordings/MP4", mp4_name)
+        metadata = loaded_sample
+        states = np.array(loaded_sample["robot_states"])
+        vpath = "/mnt/weka/home/yi.gu/world-model/evaluation/bridge/output_video0622/" + metadata["video"]
         vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
         # --
         vfps = vr.get_avg_fps()
@@ -215,10 +172,7 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         sf = ef - nframes
         indices = np.arange(sf, sf + nframes, fstp).astype(np.int64)
         # --
-        states = states[indices, :][:: self.frameskip]
-        extrinsics = extrinsics[indices, :][:: self.frameskip]
-        if self.camera_frame:
-            states = self.transform_frame(states, extrinsics)
+        states = states[indices, :]
         actions = self.poses_to_diffs(states)
         # --
         vr.seek(0)  # go to start of video before sampling frames
@@ -226,7 +180,7 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         if self.transform is not None:
             buffer = self.transform(buffer)
 
-        return buffer, actions, states, extrinsics, indices
+        return buffer, actions, states, 0, indices
 
     def __len__(self):
         return len(self.samples)
