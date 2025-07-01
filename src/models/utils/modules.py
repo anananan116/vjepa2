@@ -160,8 +160,17 @@ class ACRoPEAttention(nn.Module):
         width_ids = (ids - tokens_per_frame * frame_ids) - tokens_per_row * height_ids
         return 1.0 * frame_ids, 1.0 * height_ids, 1.0 * width_ids
 
-    def forward(self, x, mask=None, attn_mask=None, T=None, H=None, W=None, action_tokens=0):
+    def forward(self, x, mask=None, attn_mask=None, T=None, H=None, W=None, action_tokens=0, text_tokens=0):
         B, N, C = x.size()
+
+        # Split out text tokens (assuming they're always present)
+        text_x = x[:, :text_tokens, :]  # Extract text tokens
+        x = x[:, text_tokens:, :]  # Remove text tokens from main sequence
+        N = x.size(1)  # Update N to reflect new sequence length
+        
+        # Process text tokens with regular attention (no spatial positioning)
+        text_qkv = self.qkv(text_x).unflatten(-1, (3, self.num_heads, -1)).permute(2, 0, 3, 1, 4)
+        text_q, text_k, text_v = text_qkv[0], text_qkv[1], text_qkv[2]  # [B, num_heads, text_tokens, D]
 
         # -- compute position of each frame token
         if mask is not None:
@@ -177,7 +186,7 @@ class ACRoPEAttention(nn.Module):
 
         # -- split out action tokens from sequence
         if action_tokens > 0:
-            x = x.view(B, -1, action_tokens + H * W, C)  # [B, T, 1+H*W, D]
+            x = x.view(B, -1, action_tokens + H * W, C)  # [B, T, action_tokens+H*W, D]
 
             action_q, action_k, action_v = [], [], []
             for i in range(action_tokens):
@@ -232,13 +241,18 @@ class ACRoPEAttention(nn.Module):
 
             def merge_(tx, ta):
                 """tx, tx in [B, num_heads, N, D]"""
-                tx = tx.view(B, self.num_heads, T, H * W, -1)  # [B, T, H*W, D]
-                ta = ta.view(B, self.num_heads, T, action_tokens, -1)  # [B, T, A, D]
+                tx = tx.view(B, self.num_heads, T, H * W, -1)  # [B, num_heads, T, H*W, D]
+                ta = ta.view(B, self.num_heads, T, action_tokens, -1)  # [B, num_heads, T, A, D]
                 return torch.cat([ta, tx], dim=3).flatten(2, 3)
 
             q = merge_(q, action_q)
             k = merge_(k, action_k)
             v = merge_(v, action_v)
+
+        # Combine text tokens with spatial-temporal tokens
+        q = torch.cat([text_q, q], dim=2)  # [B, num_heads, text_tokens + seq_len, D]
+        k = torch.cat([text_k, k], dim=2)
+        v = torch.cat([text_v, v], dim=2)
 
         if attn_mask is not None or self.use_sdpa:
             with torch.backends.cuda.sdp_kernel():
@@ -252,7 +266,9 @@ class ACRoPEAttention(nn.Module):
             attn = self.attn_drop(attn)
             x = attn @ v
 
-        x = x.transpose(1, 2).reshape(B, N, C)
+        # Reshape including text tokens
+        final_N = N + text_tokens
+        x = x.transpose(1, 2).reshape(B, final_N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -485,10 +501,10 @@ class ACBlock(nn.Module):
         else:
             self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x, mask=None, attn_mask=None, T=None, H=None, W=None, action_tokens=0):
+    def forward(self, x, mask=None, attn_mask=None, T=None, H=None, W=None, action_tokens=0, text_tokens=0):
         y = self.norm1(x)
         if isinstance(self.attn, ACRoPEAttention):
-            y = self.attn(y, mask=mask, attn_mask=attn_mask, T=T, H=H, W=W, action_tokens=action_tokens)
+            y = self.attn(y, mask=mask, attn_mask=attn_mask, T=T, H=H, W=W, action_tokens=action_tokens, text_tokens=text_tokens)
         else:
             y = self.attn(y, mask=mask, attn_mask=attn_mask)
         x = x + self.drop_path(y)

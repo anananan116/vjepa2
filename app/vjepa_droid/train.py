@@ -27,6 +27,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
+from transformers import UMT5EncoderModel
 
 from app.vjepa_droid.droid import init_data
 from app.vjepa_droid.transforms import make_transforms
@@ -274,6 +275,10 @@ def main(args, resume_preempt=False):
     encoder = DistributedDataParallel(encoder, static_graph=True)
     predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
     target_encoder = DistributedDataParallel(target_encoder)
+    text_encoder = UMT5EncoderModel.from_pretrained(
+            "Wan-AI/Wan2.1-T2V-14B-Diffusers", subfolder="text_encoder", torch_dtype=torch.bfloat16
+        ).to(device).eval()
+    text_encoder = DistributedDataParallel(text_encoder)
     for p in target_encoder.parameters():
         p.requires_grad = False
 
@@ -390,9 +395,12 @@ def main(args, resume_preempt=False):
                 clips = sample[0].to(device, non_blocking=True)  # [B C T H W]
                 actions = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B T-1 7]
                 states = sample[2].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
-                return (clips, actions, states)
+                text_input_ids, mask = sample[5].to(device, dtype=torch.long, non_blocking=True), sample[6].to(device, dtype=torch.long, non_blocking=True)
+                return (clips, actions, states, text_input_ids, mask)
 
-            clips, actions, states = load_clips()
+            clips, actions, states, text_input_ids, mask = load_clips()
+            with torch.no_grad():
+                text_instruction = text_encoder(text_input_ids, mask).last_hidden_state
             data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
             if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
@@ -415,21 +423,21 @@ def main(args, resume_preempt=False):
 
                 def forward_predictions(z):
 
-                    def _step_predictor(_z, _a, _s, _e):
-                        _z = predictor(_z, _a, _s, _e)
+                    def _step_predictor(_z, _a, _s, _e, _t):
+                        _z = predictor(_z, _a, _s, _e, _t)
                         if normalize_reps:
                             _z = F.layer_norm(_z, (_z.size(-1),))
                         return _z
 
                     # -- one step of predictor with teacher forcing
                     _z, _a, _s, _e = z[:, :-tokens_per_frame], actions, states[:, :-1], None
-                    z_tf = _step_predictor(_z, _a, _s, _e)
+                    z_tf = _step_predictor(_z, _a, _s, _e, text_instruction)
 
                     # -- full auto-regressive rollouts of predictor
                     _z = torch.cat([z[:, : tokens_per_frame], z_tf[:, : tokens_per_frame]], dim=1)
                     for n in range(1, auto_steps):
                         _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], None
-                        _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
+                        _z_nxt = _step_predictor(_z, _a, _s, _e, text_instruction)[:, -tokens_per_frame:]
                         _z = torch.cat([_z, _z_nxt], dim=1)
                     z_ar = _z[:, tokens_per_frame:]
 

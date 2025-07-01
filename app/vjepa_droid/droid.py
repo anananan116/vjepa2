@@ -18,6 +18,7 @@ import torch.utils.data
 from decord import VideoReader, cpu
 from scipy.spatial.transform import Rotation
 import json
+from transformers import AutoTokenizer
 
 _GLOBAL_SEED = 0
 logger = getLogger()
@@ -120,7 +121,9 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
             for line in f:
                 samples.append(json.loads(line))
         self.samples = samples
-
+        # for fair comparison, we use the same text encoder as WAN
+        self.tokenizer = AutoTokenizer.from_pretrained("Wan-AI/Wan2.1-T2V-14B-Diffusers", subfolder="tokenizer")
+        
     def __getitem__(self, index):
         loaded_sample = self.samples[index]
 
@@ -128,7 +131,7 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         loaded_video = False
         while not loaded_video:
             try:
-                buffer, actions, states, extrinsics, indices = self.loadvideo_decord(loaded_sample)
+                buffer, actions, states, extrinsics, indices, text_input_ids, mask = self.loadvideo_decord(loaded_sample)
                 loaded_video = True
             except Exception as e:
                 logger.info(f"Encountered exception when loading video {loaded_sample=} {e=}")
@@ -136,7 +139,7 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
                 index = np.random.randint(self.__len__())
                 loaded_sample = self.samples[index]
 
-        return buffer, actions, states, extrinsics, indices
+        return buffer, actions, states, extrinsics, indices, text_input_ids, mask
 
     def poses_to_diffs(self, poses):
         xyz = poses[:, :3]  # shape [T, 3]
@@ -154,6 +157,9 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         # -- load metadata
         metadata = loaded_sample
         states = np.array(loaded_sample["robot_states"])
+        text_instruction = loaded_sample["instruction"]
+        text_instruction = self.tokenizer(text_instruction, return_tensors="pt", padding="max_length", truncation=True, max_length=32)
+        text_input_ids, mask = text_instruction.input_ids[0], text_instruction.attention_mask[0]
         vpath = "/mnt/weka/home/yi.gu/world-model/evaluation/bridge/output_video0622/" + metadata["video"]
         vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
         # --
@@ -180,7 +186,7 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         if self.transform is not None:
             buffer = self.transform(buffer)
 
-        return buffer, actions, states, 0, indices
+        return buffer, actions, states, 0, indices, text_input_ids, mask
 
     def __len__(self):
         return len(self.samples)

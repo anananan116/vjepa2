@@ -54,7 +54,8 @@ class VisionTransformerPredictorAC(nn.Module):
         self.action_encoder = nn.Linear(action_embed_dim, predictor_embed_dim, bias=True)
         self.state_encoder = nn.Linear(action_embed_dim, predictor_embed_dim, bias=True)
         self.extrinsics_encoder = nn.Linear(action_embed_dim - 1, predictor_embed_dim, bias=True)
-
+        self.text_encoder = nn.Linear(4096, predictor_embed_dim, bias=True)
+        
         # Determine positional embedding
         if type(img_size) is int:
             img_size = (img_size, img_size)
@@ -133,7 +134,7 @@ class VisionTransformerPredictorAC(nn.Module):
             rescale(layer.attn.proj.weight.data, layer_id + 1)
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
-    def forward(self, x, actions, states, extrinsics=None):
+    def forward(self, x, actions, states, extrinsics=None, text_instruction=None):
         """
         :param x: context tokens
         """
@@ -151,9 +152,32 @@ class VisionTransformerPredictorAC(nn.Module):
             x = torch.cat([a, s, e, x], dim=2).flatten(1, 2)  # [B, T*(H*W+3), D]
         else:
             x = torch.cat([a, s, x], dim=2).flatten(1, 2)  # [B, T*(H*W+2), D]
-
+        
+        # Add text instruction and track number of text tokens
+        text_cond = self.text_encoder(text_instruction)
+        if text_cond.dim() == 2:  # [B, D] -> [B, 1, D]
+            text_cond = text_cond.unsqueeze(1)
+        text_tokens = text_cond.size(1)
+        x = torch.cat([text_cond, x], dim=1)
+        
         cond_tokens = 3 if self.use_extrinsics else 2
-        attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
+        
+        # Simplified attention mask creation
+        # Reuse pre-computed frame mask and extend for text tokens
+        frame_seq_len = x.size(1) - text_tokens
+        total_seq_len = x.size(1)
+        
+        # Create extended mask: [text_tokens + frame_seq_len, text_tokens + frame_seq_len]
+        attn_mask = torch.zeros(total_seq_len, total_seq_len, dtype=torch.bool, device=x.device)
+        
+        # Text tokens can only attend to themselves (causal within text)
+        attn_mask[:text_tokens, :text_tokens] = torch.tril(torch.ones(text_tokens, text_tokens, dtype=torch.bool, device=x.device))
+        
+        # All other tokens can attend to text tokens (text provides context)
+        attn_mask[text_tokens:, :text_tokens] = True
+        
+        # Use pre-computed frame mask for action/frame tokens
+        attn_mask[text_tokens:, text_tokens:] = self.attn_mask[:frame_seq_len, :frame_seq_len].to(x.device)
 
         # Fwd prop
         for i, blk in enumerate(self.predictor_blocks):
@@ -167,6 +191,7 @@ class VisionTransformerPredictorAC(nn.Module):
                     H=self.grid_height,
                     W=self.grid_width,
                     action_tokens=cond_tokens,
+                    text_tokens=text_tokens,
                     use_reentrant=False,
                 )
             else:
@@ -178,8 +203,13 @@ class VisionTransformerPredictorAC(nn.Module):
                     H=self.grid_height,
                     W=self.grid_width,
                     action_tokens=cond_tokens,
+                    text_tokens=text_tokens,
                 )
 
+        # Split out text tokens first, then action and frame tokens
+        text_out = x[:, :text_tokens, :]  # Extract text tokens
+        x = x[:, text_tokens:, :]  # Remove text tokens from sequence
+        
         # Split out action and frame tokens
         x = x.view(B, T, cond_tokens + self.grid_height * self.grid_width, D)  # [B, T, K+H*W, D]
         x = x[:, :, cond_tokens:, :].flatten(1, 2)
