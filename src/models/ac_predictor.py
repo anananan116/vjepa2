@@ -41,19 +41,13 @@ class VisionTransformerPredictorAC(nn.Module):
         is_frame_causal=True,
         use_activation_checkpointing=False,
         use_rope=True,
-        action_embed_dim=7,
-        use_extrinsics=False,
         **kwargs
     ):
         super().__init__()
         self.is_frame_causal = is_frame_causal
-        self.use_extrinsics = use_extrinsics
 
         # Map input to predictor dimension
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
-        self.action_encoder = nn.Linear(action_embed_dim, predictor_embed_dim, bias=True)
-        self.state_encoder = nn.Linear(action_embed_dim, predictor_embed_dim, bias=True)
-        self.extrinsics_encoder = nn.Linear(action_embed_dim - 1, predictor_embed_dim, bias=True)
         self.text_encoder = nn.Linear(4096, predictor_embed_dim, bias=True)
         
         # Determine positional embedding
@@ -113,7 +107,7 @@ class VisionTransformerPredictorAC(nn.Module):
             grid_height = self.img_height // self.patch_size
             grid_width = self.img_width // self.patch_size
             attn_mask = build_action_block_causal_attention_mask(
-                grid_depth, grid_height, grid_width, add_tokens=3 if use_extrinsics else 2
+                grid_depth, grid_height, grid_width, add_tokens=0
             )
         self.attn_mask = attn_mask
 
@@ -134,7 +128,7 @@ class VisionTransformerPredictorAC(nn.Module):
             rescale(layer.attn.proj.weight.data, layer_id + 1)
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
 
-    def forward(self, x, actions, states, extrinsics=None, text_instruction=None):
+    def forward(self, x, text_instruction=None):
         """
         :param x: context tokens
         """
@@ -143,15 +137,9 @@ class VisionTransformerPredictorAC(nn.Module):
         B, N_ctxt, D = x.size()
         T = N_ctxt // (self.grid_height * self.grid_width)
 
-        # Interleave action tokens
-        s = self.state_encoder(states).unsqueeze(2)
-        a = self.action_encoder(actions).unsqueeze(2)
+        # Reshape video tokens
         x = x.view(B, T, self.grid_height * self.grid_width, D)  # [B, T, H*W, D]
-        if self.use_extrinsics:
-            e = self.extrinsics_encoder(extrinsics).unsqueeze(2)
-            x = torch.cat([a, s, e, x], dim=2).flatten(1, 2)  # [B, T*(H*W+3), D]
-        else:
-            x = torch.cat([a, s, x], dim=2).flatten(1, 2)  # [B, T*(H*W+2), D]
+        x = x.flatten(1, 2)  # [B, T*H*W, D]
         
         # Add text instruction and track number of text tokens
         text_cond = self.text_encoder(text_instruction)
@@ -160,7 +148,7 @@ class VisionTransformerPredictorAC(nn.Module):
         text_tokens = text_cond.size(1)
         x = torch.cat([text_cond, x], dim=1)
         
-        cond_tokens = 3 if self.use_extrinsics else 2
+        cond_tokens = 0  # No action/state tokens
         
         # Simplified attention mask creation
         # Reuse pre-computed frame mask and extend for text tokens
@@ -176,7 +164,7 @@ class VisionTransformerPredictorAC(nn.Module):
         # All other tokens can attend to text tokens (text provides context)
         attn_mask[text_tokens:, :text_tokens] = True
         
-        # Use pre-computed frame mask for action/frame tokens
+        # Use pre-computed frame mask for frame tokens
         attn_mask[text_tokens:, text_tokens:] = self.attn_mask[:frame_seq_len, :frame_seq_len].to(x.device)
 
         # Fwd prop
@@ -206,13 +194,13 @@ class VisionTransformerPredictorAC(nn.Module):
                     text_tokens=text_tokens,
                 )
 
-        # Split out text tokens first, then action and frame tokens
+        # Split out text tokens first, then frame tokens
         text_out = x[:, :text_tokens, :]  # Extract text tokens
         x = x[:, text_tokens:, :]  # Remove text tokens from sequence
         
-        # Split out action and frame tokens
-        x = x.view(B, T, cond_tokens + self.grid_height * self.grid_width, D)  # [B, T, K+H*W, D]
-        x = x[:, :, cond_tokens:, :].flatten(1, 2)
+        # No need to split out action tokens since we don't have any
+        x = x.view(B, T, self.grid_height * self.grid_width, D)  # [B, T, H*W, D]
+        x = x.flatten(1, 2)
 
         x = self.predictor_norm(x)
         x = self.predictor_proj(x)

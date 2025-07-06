@@ -16,7 +16,6 @@ import pandas as pd
 import torch
 import torch.utils.data
 from decord import VideoReader, cpu
-from scipy.spatial.transform import Rotation
 import json
 from transformers import AutoTokenizer
 
@@ -116,77 +115,54 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         self.camera_views = camera_views
         self.h5_name = "trajectory.h5"
 
-        samples = []
-        with open(data_path, "r") as f:
-            for line in f:
-                samples.append(json.loads(line))
-        self.samples = samples
+        # Read CSV data
+        self.df = pd.read_csv(data_path)
+        logger.info(f"Loaded {len(self.df)} samples from CSV: {data_path}")
+        
         # for fair comparison, we use the same text encoder as WAN
         self.tokenizer = AutoTokenizer.from_pretrained("Wan-AI/Wan2.1-T2V-14B-Diffusers", subfolder="tokenizer")
         
     def __getitem__(self, index):
-        loaded_sample = self.samples[index]
+        loaded_sample = self.df.iloc[index]
 
         # -- keep trying to load videos until you find a valid sample
         loaded_video = False
         while not loaded_video:
             try:
-                buffer, actions, states, extrinsics, indices, text_input_ids, mask = self.loadvideo_decord(loaded_sample)
+                buffer, indices, text_input_ids, mask = self.loadvideo_decord(loaded_sample)
                 loaded_video = True
             except Exception as e:
                 logger.info(f"Encountered exception when loading video {loaded_sample=} {e=}")
                 loaded_video = False
                 index = np.random.randint(self.__len__())
-                loaded_sample = self.samples[index]
+                loaded_sample = self.df.iloc[index]
 
-        return buffer, actions, states, extrinsics, indices, text_input_ids, mask
-
-    def poses_to_diffs(self, poses):
-        xyz = poses[:, :3]  # shape [T, 3]
-        thetas = poses[:, 3:6]  # euler angles, shape [T, 3]
-        matrices = [Rotation.from_euler("xyz", theta, degrees=False).as_matrix() for theta in thetas]
-        xyz_diff = xyz[1:] - xyz[:-1]
-        angle_diff = [matrices[t + 1] @ matrices[t].T for t in range(len(matrices) - 1)]
-        angle_diff = [Rotation.from_matrix(mat).as_euler("xyz", degrees=False) for mat in angle_diff]
-        angle_diff = np.stack([d for d in angle_diff], axis=0)
-        closedness = poses[:, -1:]
-        closedness_delta = closedness[1:] - closedness[:-1]
-        return np.concatenate([xyz_diff, angle_diff, closedness_delta], axis=1)
+        return buffer, indices, text_input_ids, mask
 
     def loadvideo_decord(self, loaded_sample):
-        # -- load metadata
-        metadata = loaded_sample
-        states = np.array(loaded_sample["robot_states"])
-        text_instruction = loaded_sample["instruction"]
+        # -- load metadata from CSV row
+        text_instruction = loaded_sample["action_text"]
         text_instruction = self.tokenizer(text_instruction, return_tensors="pt", padding="max_length", truncation=True, max_length=32)
         text_input_ids, mask = text_instruction.input_ids[0], text_instruction.attention_mask[0]
-        vpath = "/mnt/weka/home/yi.gu/world-model/evaluation/bridge/output_video0622/" + metadata["video"]
+        vpath = loaded_sample["video_path"]
         vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
         # --
-        vfps = vr.get_avg_fps()
         fpc = self.frames_per_clip
-        fps = self.fps if self.fps is not None else vfps
-        fstp = ceil(vfps / fps)
-        nframes = int(fpc * fstp)
         vlen = len(vr)
 
-        if vlen < nframes:
-            raise Exception(f"Video is too short {vpath=}, {nframes=}, {vlen=}")
+        if vlen < fpc:
+            raise Exception(f"Video is too short {vpath=}, {fpc=}, {vlen=}")
 
-        # sample a random window of nframes
-        ef = np.random.randint(nframes, vlen)
-        sf = ef - nframes
-        indices = np.arange(sf, sf + nframes, fstp).astype(np.int64)
-        # --
-        states = states[indices, :]
-        actions = self.poses_to_diffs(states)
+        # sample a random window of consecutive frames
+        sf = np.random.randint(0, vlen - fpc + 1)
+        indices = np.arange(sf, sf + fpc).astype(np.int64)
         # --
         vr.seek(0)  # go to start of video before sampling frames
         buffer = vr.get_batch(indices).asnumpy()
         if self.transform is not None:
             buffer = self.transform(buffer)
 
-        return buffer, actions, states, 0, indices, text_input_ids, mask
+        return buffer, indices, text_input_ids, mask
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.df)

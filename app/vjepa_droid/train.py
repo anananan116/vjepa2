@@ -97,7 +97,6 @@ def main(args, resume_preempt=False):
     use_silu = cfgs_model.get("use_silu", False)
     use_pred_silu = cfgs_model.get("use_pred_silu", False)
     wide_silu = cfgs_model.get("wide_silu", True)
-    use_extrinsics = cfgs_model.get("use_extrinsics", False)
 
     # -- DATA
     cfgs_data = args.get("data")
@@ -201,9 +200,7 @@ def main(args, resume_preempt=False):
         pred_depth=pred_depth,
         pred_num_heads=pred_num_heads,
         pred_embed_dim=pred_embed_dim,
-        action_embed_dim=7,
         pred_is_frame_causal=pred_is_frame_causal,
-        use_extrinsics=use_extrinsics,
         use_sdpa=use_sdpa,
         use_silu=use_silu,
         use_pred_silu=use_pred_silu,
@@ -275,9 +272,15 @@ def main(args, resume_preempt=False):
     encoder = DistributedDataParallel(encoder, static_graph=True)
     predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
     target_encoder = DistributedDataParallel(target_encoder)
-    text_encoder = UMT5EncoderModel.from_pretrained(
-            "Wan-AI/Wan2.1-T2V-14B-Diffusers", subfolder="text_encoder", torch_dtype=torch.bfloat16
-        ).to(device).eval()
+    logger.info("Initializing text encoder...")
+    try:
+        text_encoder = UMT5EncoderModel.from_pretrained(
+                "Wan-AI/Wan2.1-T2V-14B-Diffusers", subfolder="text_encoder", torch_dtype=torch.bfloat16
+            ).to(device).eval()
+        logger.info("Text encoder loaded successfully")
+    except Exception as e:
+        logger.error(f"Failed to load text encoder: {e}")
+        raise
     text_encoder = DistributedDataParallel(text_encoder)
     for p in target_encoder.parameters():
         p.requires_grad = False
@@ -393,12 +396,10 @@ def main(args, resume_preempt=False):
 
             def load_clips():
                 clips = sample[0].to(device, non_blocking=True)  # [B C T H W]
-                actions = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B T-1 7]
-                states = sample[2].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
-                text_input_ids, mask = sample[5].to(device, dtype=torch.long, non_blocking=True), sample[6].to(device, dtype=torch.long, non_blocking=True)
-                return (clips, actions, states, text_input_ids, mask)
+                text_input_ids, mask = sample[2].to(device, dtype=torch.long, non_blocking=True), sample[3].to(device, dtype=torch.long, non_blocking=True)
+                return (clips, text_input_ids, mask)
 
-            clips, actions, states, text_input_ids, mask = load_clips()
+            clips, text_input_ids, mask = load_clips()
             with torch.no_grad():
                 text_instruction = text_encoder(text_input_ids, mask).last_hidden_state
             data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
@@ -423,21 +424,20 @@ def main(args, resume_preempt=False):
 
                 def forward_predictions(z):
 
-                    def _step_predictor(_z, _a, _s, _e, _t):
-                        _z = predictor(_z, _a, _s, _e, _t)
+                    def _step_predictor(_z, _t):
+                        _z = predictor(_z, _t)
                         if normalize_reps:
                             _z = F.layer_norm(_z, (_z.size(-1),))
                         return _z
 
                     # -- one step of predictor with teacher forcing
-                    _z, _a, _s, _e = z[:, :-tokens_per_frame], actions, states[:, :-1], None
-                    z_tf = _step_predictor(_z, _a, _s, _e, text_instruction)
+                    _z = z[:, :-tokens_per_frame]
+                    z_tf = _step_predictor(_z, text_instruction)
 
                     # -- full auto-regressive rollouts of predictor
                     _z = torch.cat([z[:, : tokens_per_frame], z_tf[:, : tokens_per_frame]], dim=1)
                     for n in range(1, auto_steps):
-                        _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], None
-                        _z_nxt = _step_predictor(_z, _a, _s, _e, text_instruction)[:, -tokens_per_frame:]
+                        _z_nxt = _step_predictor(_z, text_instruction)[:, -tokens_per_frame:]
                         _z = torch.cat([_z, _z_nxt], dim=1)
                     z_ar = _z[:, tokens_per_frame:]
 
